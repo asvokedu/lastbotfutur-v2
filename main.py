@@ -14,7 +14,7 @@ import requests
 import pyodbc
 
 MODEL_DIR = "models"
-MIN_ROWS_TO_PREDICT = 50
+MIN_ROWS_TO_PREDICT = 1
 
 logging.basicConfig(
     level=logging.INFO,
