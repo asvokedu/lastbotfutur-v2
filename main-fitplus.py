@@ -28,7 +28,7 @@ def get_sql_connection():
         "DRIVER={ODBC Driver 17 for SQL Server};"
         "SERVER=localhost;"
         "DATABASE=gotbai;"
-        "UID=sa;PWD=123"
+        "UID=sa;PWD=LEtoy_89"
     )
 
 def read_symbols_from_file(filepath="listsyombol.txt"):
