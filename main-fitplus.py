@@ -6,11 +6,10 @@ import pandas as pd
 from datetime import datetime, timedelta
 from ta.trend import MACD
 from ta.momentum import RSIIndicator
-from evaluate_performance import log_backtest_performance
-from main import get_sql_connection
 import time
 import requests
 import pyodbc
+from concurrent.futures import ThreadPoolExecutor
 
 MODEL_DIR = "models"
 CACHE_DIR = "cache"
@@ -23,6 +22,14 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+def get_sql_connection():
+    return pyodbc.connect(
+        "DRIVER={ODBC Driver 17 for SQL Server};"
+        "SERVER=localhost;"
+        "DATABASE=gotbai;"
+        "UID=sa;PWD=123"
+    )
 
 def read_symbols_from_file(filepath="listsyombol.txt"):
     with open(filepath, "r") as f:
@@ -67,11 +74,9 @@ def fetch_binance_klines_batch(symbol, interval, start_time=None, end_time=None)
 def analyze_symbol(symbol):
     logging.info(f"🔍 Menganalisis {symbol}...")
 
-    # Cek apakah model ada dalam cache
     model_cache_path = os.path.join(CACHE_DIR, f"{symbol}_model.pkl")
     model, features = None, None
 
-    # Cek cache model atau gunakan model dari file
     if os.path.exists(model_cache_path):
         model, features = joblib.load(model_cache_path)
         logging.info(f"Model cache ditemukan untuk {symbol}. Menggunakan model yang ada.")
@@ -84,7 +89,6 @@ def analyze_symbol(symbol):
             logging.error(f"❌ Model tidak tersedia untuk {symbol}")
             return
 
-    # Ambil data candle 1 jam terakhir
     now = datetime.utcnow()
     last_hour = now - timedelta(minutes=60)
     df = fetch_binance_klines_batch(symbol, "1h", start_time=last_hour, end_time=now)
@@ -93,7 +97,6 @@ def analyze_symbol(symbol):
         logging.warning(f"⚠️ Data tidak tersedia untuk {symbol}.")
         return
 
-    # Hitung indikator teknikal
     df["rsi"] = RSIIndicator(close=df["close"]).rsi()
     macd = MACD(close=df["close"])
     df["macd"] = macd.macd()
@@ -118,7 +121,6 @@ def analyze_symbol(symbol):
 
     logging.info(f"✅ Prediksi {symbol}: {pred_label} | Price: {price:.4f} | Confidence: {confidence:.2f}%")
 
-    # Simpan hasil ke DB
     try:
         conn = get_sql_connection()
         cursor = conn.cursor()
@@ -130,7 +132,6 @@ def analyze_symbol(symbol):
         """, tgl, jam, symbol, pred_label, "1h", price, confidence, volume)
         conn.commit()
 
-        # Update future_price dari jam sebelumnya
         prev = now - timedelta(hours=1)
         cursor.execute("""
             UPDATE predict_log
@@ -156,14 +157,30 @@ def analyze_symbol(symbol):
 
 def run_all():
     symbols = read_symbols_from_file()
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        executor.map(analyze_symbol, symbols)
+
     for symbol in symbols:
         for interval in ["1h", "4h"]:
             try:
                 now = datetime.utcnow()
-                last_hour = now - timedelta(minutes={"1h": 60, "4h": 240}[interval])
-                df = fetch_binance_klines_batch(symbol, interval, start_time=last_hour, end_time=now)
+                last_period = now - timedelta(minutes={"1h": 60, "4h": 240}[interval])
+                df = fetch_binance_klines_batch(symbol, interval, start_time=last_period, end_time=now)
+
                 if df.empty:
+                    if interval == "4h":
+                        logging.warning(f"⚠️ Data 4h kosong untuk {symbol}. Kemungkinan candle belum terbentuk.")
                     continue
+
+                if interval == "4h":
+                    latest_ts = df["timestamp"].max()
+                    if latest_ts.minute != 0 or latest_ts.hour % 4 != 0:
+                        logging.warning(
+                            f"⏳ Data 4h belum lengkap untuk {symbol}. Candle terakhir pada {latest_ts}. Menunggu selesai terbentuk."
+                        )
+                        continue
+
                 conn = get_sql_connection()
                 cursor = conn.cursor()
                 for _, row in df.iterrows():
@@ -180,9 +197,9 @@ def run_all():
                 conn.commit()
                 cursor.close()
                 conn.close()
+
             except Exception as e:
-                logging.warning(f"Gagal update data {symbol}-{interval}: {e}")
-        analyze_symbol(symbol)
+                logging.warning(f"⚠️ Gagal update data {symbol}-{interval}: {e}")
 
 def main_loop():
     while True:
