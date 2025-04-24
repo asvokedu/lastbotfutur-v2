@@ -10,6 +10,8 @@ from evaluate_performance import log_backtest_performance
 from main import get_sql_connection
 from utils import fetch_binance_data, calculate_technical_indicators
 import time
+import requests
+import pyodbc
 
 MODEL_DIR = "models"
 MIN_ROWS_TO_PREDICT = 50
@@ -35,6 +37,33 @@ def wait_until_next_candle():
         print(f"⏳ Menuju candle baru (1h) dalam {i} detik...", end="\r")
         time.sleep(1)
     print()
+
+def fetch_binance_klines_batch(symbol, interval, start_time=None, end_time=None):
+    base_url = "https://api.binance.com/api/v3/klines"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": 1000,
+    }
+    if start_time:
+        params["startTime"] = int(start_time.timestamp() * 1000)
+    if end_time:
+        params["endTime"] = int(end_time.timestamp() * 1000)
+
+    response = requests.get(base_url, params=params, timeout=10)
+    data = response.json()
+    if not isinstance(data, list):
+        raise Exception(f"Unexpected response for {symbol}: {data}")
+
+    df = pd.DataFrame(data, columns=[
+        "timestamp", "open", "high", "low", "close", "volume",
+        "close_time", "qav", "num_trades", "taker_base", "taker_quote", "ignore"
+    ])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df = df[["timestamp", "open", "high", "low", "close", "volume"]].astype({
+        "open": float, "high": float, "low": float, "close": float, "volume": float
+    })
+    return df
 
 def analyze_symbol(symbol):
     logging.info(f"🔍 Menganalisis {symbol}...")
@@ -83,7 +112,6 @@ def analyze_symbol(symbol):
             """, tgl, jam, symbol, pred_label, "1h", price, confidence, volume)
             conn.commit()
 
-            # Update prediksi sebelumnya
             prev = now - timedelta(hours=1)
             cursor.execute("""
                 UPDATE predict_log
@@ -113,14 +141,39 @@ def analyze_symbol(symbol):
 
 def run_all():
     symbols = read_symbols_from_file()
-    for sym in symbols:
-        analyze_symbol(sym)
+    for symbol in symbols:
+        for interval in ["1h", "4h"]:
+            try:
+                now = datetime.utcnow()
+                last_hour = now - timedelta(minutes={"1h": 60, "4h": 240}[interval])
+                df = fetch_binance_klines_batch(symbol, interval, start_time=last_hour, end_time=now)
+                if df.empty:
+                    continue
+                conn = get_sql_connection()
+                cursor = conn.cursor()
+                for _, row in df.iterrows():
+                    cursor.execute("""
+                        IF NOT EXISTS (
+                            SELECT 1 FROM historical_klines WHERE symbol = ? AND interval = ? AND timestamp = ?
+                        )
+                        INSERT INTO historical_klines (
+                            symbol, interval, timestamp, opened, high, low, closet, volume
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, symbol, interval, row["timestamp"],
+                          symbol, interval, row["timestamp"],
+                          row["open"], row["high"], row["low"], row["close"], row["volume"])
+                conn.commit()
+                cursor.close()
+                conn.close()
+            except Exception as e:
+                logging.warning(f"Gagal update data {symbol}-{interval}: {e}")
+        analyze_symbol(symbol)
 
 def main_loop():
     while True:
         logging.info(f"🕒 Sinkronisasi waktu {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
         wait_until_next_candle()
-        logging.info("🚀 Mulai analisa prediksi jam baru")
+        logging.info("🚀 Mulai update data & analisa prediksi")
         run_all()
 
 if __name__ == "__main__":
